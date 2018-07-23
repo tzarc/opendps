@@ -23,10 +23,106 @@
  */
 
 #include "pwrctl.h"
+#include "tick.h"
+#include "hw.h"
+#include "dbg_printf.h"
 #include "dps-model.h"
 #include "pastunits.h"
 #include <gpio.h>
 #include <dac.h>
+
+/**********************/
+
+#define DEFAULT_CV_KP 0.65
+#define DEFAULT_CV_KI 0.058
+#define DEFAULT_CV_KD 0.26
+#define DEFAULT_CV_KB 1
+
+typedef struct pidctrl_t
+{
+    uint64_t last_ticks;
+    float last_err;
+    float integral;
+    float Kp, Ki, Kd, Kb; // proportional, integral, derivative, bias
+
+    float control_limit_lo;
+    float control_limit_hi;
+} pidctrl_t;
+
+void reset_pidctrl(pidctrl_t *pidctrl, float Kp, float Ki, float Kd, float Kb, float control_limit_lo, float control_limit_hi);
+uint32_t update_pidctrl(pidctrl_t *pidctrl, uint64_t ticks, uint32_t out_intended, uint32_t out_measured);
+
+void reset_pidctrl(pidctrl_t *pidctrl, float Kp, float Ki, float Kd, float Kb, float control_limit_lo, float control_limit_hi)
+{
+    pidctrl->last_ticks = get_ticks();
+    pidctrl->last_err = 0;
+    pidctrl->integral = 0;
+    pidctrl->Kp = Kp;
+    pidctrl->Ki = Ki;
+    pidctrl->Kd = Kd;
+    pidctrl->Kb = Kb;
+    pidctrl->control_limit_lo = control_limit_lo;
+    pidctrl->control_limit_hi = control_limit_hi;
+}
+
+#ifdef CONFIG_COMMANDLINE
+static int counter = 0;
+#endif // CONFIG_COMMANDLINE
+
+uint32_t update_pidctrl(pidctrl_t *pidctrl, uint64_t ticks, uint32_t out_intended, uint32_t out_measured)
+{
+    // Work out how long between calls
+    float timeDelta = ticks - pidctrl->last_ticks;
+    pidctrl->last_ticks = ticks;
+
+    // Get the last error, so we can run a derivative
+    float last_err = pidctrl->last_err;
+
+    // Work out the coefficients
+    float err = (float)out_intended - (float)out_measured;
+    float integral = pidctrl->integral + (err * timeDelta);
+    float derivative = (err - last_err) / timeDelta;
+
+    // Save the last error
+    pidctrl->last_err = err;
+
+    // Perform the PID calculation
+    float out_pid = (pidctrl->Kp * err) + (pidctrl->Ki * integral) + (pidctrl->Kd * derivative) + pidctrl->Kb;
+
+    // Work out if we need to limit the control output
+    bool wasLimited = false;
+    if(out_pid < pidctrl->control_limit_lo)
+    {
+        wasLimited = true;
+        out_pid = pidctrl->control_limit_lo;
+    }
+    if(out_pid > pidctrl->control_limit_hi)
+    {
+        wasLimited = true;
+        out_pid = pidctrl->control_limit_hi;
+    }
+
+    // Only if we're in the allowed range do we try to update the integral, otherwise we could get wild variation (avoiding integral windup)
+    if(!wasLimited)
+        pidctrl->integral = integral;
+
+#ifdef CONFIG_COMMANDLINE
+    ++counter;
+    if(counter == 1000) {
+        dbg_printf("\n");
+        dbg_printf("Vp = %d, Vi = %d, Vd = %d, Vb = %d\n", (int)(pidctrl->Kp * err), (int)(pidctrl->Ki * integral), (int)(pidctrl->Kd * derivative), (int)pidctrl->Kb);
+        dbg_printf("dt = %d, err = %d, integral = %d, derivative = %d\n", (int)timeDelta, (int)err, (int)integral, (int)derivative);
+        dbg_printf("PID output: %d, intended: %d, measured: %d, PID control: %d\n", (int)(out_intended + out_pid), out_intended, out_measured, (int)out_pid);
+        dbg_printf("Kp = %d, Ki = %d, Kd = %d, Kb = %d, last_err = %d, integral = %d\n", (int)(pidctrl->Kp*1000), (int)(pidctrl->Ki*1000), (int)(pidctrl->Kd*1000), (int)pidctrl->Kb, (int)pidctrl->last_err, (int)pidctrl->integral);
+        counter = 0;
+    }
+#endif // CONFIG_COMMANDLINE
+
+    // Output the control value
+    return (uint32_t)out_pid;
+}
+
+/**********************/
 
 /** This module handles voltage and current calculations
   * Calculations based on measurements found at
@@ -35,6 +131,8 @@
 
 static uint32_t i_out, v_out, i_limit;
 static bool v_out_enabled;
+static pidctrl_t pidctrl_cv;
+static int tick_counter = 0;
 
 float a_adc_k_coef = A_ADC_K;
 float a_adc_c_coef = A_ADC_C;
@@ -49,6 +147,26 @@ float vin_adc_c_coef = VIN_ADC_C;
 
 /** not static as it is referred to from hw.c for performance reasons */
 uint32_t pwrctl_i_limit_raw;
+
+/**
+  * @brief Timer callback for handling the output voltage PID controller
+  * @retval none
+  */
+static void pwrctl_systick_callback(uint64_t tick_ms)
+{
+    ++tick_counter;
+    if(tick_counter < 10) // Only update once every 10ms.
+        return;
+    tick_counter = 0;
+
+    if(v_out_enabled) {
+        uint16_t i_out_raw, v_in_raw, v_out_raw;
+        hw_get_adc_values(&i_out_raw, &v_in_raw, &v_out_raw);
+        uint32_t v_measured = pwrctl_calc_vout(v_out_raw);
+        uint32_t pid = update_pidctrl(&pidctrl_cv, tick_ms, v_out, v_measured);
+        DAC_DHR12R1 = pwrctl_calc_vout_dac(v_out + pid);
+    }
+}
 
 /**
   * @brief Initialize the power control module
@@ -94,6 +212,7 @@ void pwrctl_init(past_t *past)
         vin_adc_c_coef = *p;
 
     pwrctl_enable_vout(false);
+    set_systick_callback(pwrctl_systick_callback);
 }
 
 /**
@@ -106,9 +225,11 @@ bool pwrctl_set_vout(uint32_t value_mv)
     /** @todo Check with max Vout, currently filtered by ui.c */
     v_out = value_mv;
     if (v_out_enabled) {
+        reset_pidctrl(&pidctrl_cv, DEFAULT_CV_KP, DEFAULT_CV_KI, DEFAULT_CV_KD, DEFAULT_CV_KB, -(float)(value_mv/10), +(float)(value_mv/10));
         /** Needed for the DPS5005 "communications version" (the one with BT/USB) */
         DAC_DHR12R1 = pwrctl_calc_vout_dac(v_out);
     } else {
+        reset_pidctrl(&pidctrl_cv, DEFAULT_CV_KP, DEFAULT_CV_KI, DEFAULT_CV_KD, DEFAULT_CV_KB, 0, 0);
         DAC_DHR12R1 = 0;
     }
     return true;

@@ -1,18 +1,18 @@
-/* 
+/*
  * The MIT License (MIT)
- * 
+ *
  * Copyright (c) 2017 Johan Kanflo (github.com/kanflo)
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  * copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -28,6 +28,7 @@
 #include "tick.h"
 
 static volatile uint64_t tick_ms;
+static void (*systick_callback)(uint64_t tick_ms);
 
 /**
   * @brief Initialize the systick module
@@ -55,7 +56,7 @@ void systick_init(void)
 void delay_ms(uint32_t delay)
 {
     uint64_t start = tick_ms;
-    while (tick_ms < start + delay) ;    
+    while (tick_ms < start + delay) ;
 }
 
 /**
@@ -74,5 +75,15 @@ uint64_t get_ticks(void)
 void sys_tick_handler(void)
 {
     tick_ms++;
+    if(systick_callback)
+        (*systick_callback)(tick_ms);
 }
 
+/**
+  * @brief Set systick callback
+  * @retval none
+  */
+void set_systick_callback(void (*callback)(uint64_t tick_ms))
+{
+    systick_callback = callback;
+}
